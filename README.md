@@ -2,6 +2,8 @@
 
 Customize the color of the special-loot hole that appears after killing Doom of Mokhaiotl.
 
+<img src="assets/doom-unique-colors.gif" alt="Doom Unique Colors demo" height="300">
+
 The shipped plugin hardcodes RuneLite's current `DOM_DESCEND_HOLE_UNIQUE` object ID, `50940`.
 Players can change the color, but not the target object ID.
 
