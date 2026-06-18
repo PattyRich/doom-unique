@@ -42,13 +42,6 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 
-/**
- * Shipped, player-facing version of the plugin. The local-testing tooling that used to live
- * here (discovery mode, temporary test-object recolor, swap-to-unique-hole, and the raw object
- * definition cache parser) has been moved to dev-tools/full-version at the repo root. That code
- * never ran for a normal player (it's all opt-in/off by default) but it added real maintenance
- * and review surface for zero player benefit, so it doesn't ship.
- */
 @PluginDescriptor(
 	name = "Doom Unique Colors",
 	description = "Customize the special-loot hole color at Doom of Mokhaiotl",
@@ -218,13 +211,13 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 
 	private void scanSceneForHoles()
 	{
-		if (!isSceneReady() || !hasConfiguredSceneTargets())
-		{
-			return;
-		}
-
 		try
 		{
+			if (!isSceneReady() || !hasConfiguredSceneTargets())
+			{
+				return;
+			}
+
 			forEachSceneObject(this::handleSceneObjectSafely);
 		}
 		catch (RuntimeException | AssertionError ex)
@@ -312,7 +305,7 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		{
 			if (!isModelStillTracked(previousModel))
 			{
-				resetModel(previousModel);
+				resetModelSafely(previousModel);
 			}
 		}
 	}
@@ -374,12 +367,12 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		markGoldFaces(model.getFaceColors3(), changedFaces);
 		markGoldFaces(model.getUnlitFaceColors(), changedFaces);
 		markSharedTextureFaces(model.getFaceTextures(), changedFaces);
-		markConnectedSoftGoldFaces(model, changedFaces);
+		markConnectedFaces(model, changedFaces, 3, this::isSoftGoldFace);
 		markCoolArtifactFaces(model.getFaceColors1(), changedFaces);
 		markCoolArtifactFaces(model.getFaceColors2(), changedFaces);
 		markCoolArtifactFaces(model.getFaceColors3(), changedFaces);
 		markCoolArtifactFaces(model.getUnlitFaceColors(), changedFaces);
-		markConnectedCoolArtifactFaces(model, changedFaces);
+		markConnectedFaces(model, changedFaces, 2, this::isCoolArtifactFace);
 		markMutedInteriorFaces(model, changedFaces);
 		markSharedTextureFaces(model.getFaceTextures(), changedFaces);
 		return changedFaces;
@@ -492,22 +485,29 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		}
 	}
 
-	private void markConnectedSoftGoldFaces(Model model, boolean[] changedFaces)
+	private void markConnectedFaces(Model model, boolean[] changedFaces, int passes, FaceMatcher faceMatcher)
 	{
 		int[] faceIndices1 = model.getFaceIndices1();
 		int[] faceIndices2 = model.getFaceIndices2();
 		int[] faceIndices3 = model.getFaceIndices3();
+		float[] verticesX = model.getVerticesX();
+		float[] verticesY = model.getVerticesY();
+		float[] verticesZ = model.getVerticesZ();
 		if (faceIndices1 == null || faceIndices2 == null || faceIndices3 == null)
 		{
 			return;
 		}
 
 		int faceCount = Math.min(model.getFaceCount(), changedFaces.length);
-		faceCount = Math.min(faceCount, Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
-		for (int pass = 0; pass < 3; pass++)
+		faceCount = Math.min(faceCount,
+			Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
+		int verticesCount = geometryVertexCount(model, verticesX, verticesY, verticesZ);
+		for (int pass = 0; pass < passes; pass++)
 		{
 			Set<Long> changedEdges = changedFaceEdges(faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
-			if (changedEdges.isEmpty())
+			Set<String> changedGeometryEdges = changedGeometryEdges(verticesX, verticesY, verticesZ, verticesCount,
+				faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
+			if (changedEdges.isEmpty() && changedGeometryEdges.isEmpty())
 			{
 				return;
 			}
@@ -515,54 +515,14 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 			boolean foundMore = false;
 			for (int face = 0; face < faceCount; face++)
 			{
-				if (changedFaces[face] || !isSoftGoldFace(model, face))
+				if (changedFaces[face] || !faceMatcher.matches(model, face))
 				{
 					continue;
 				}
 
-				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face]))
-				{
-					changedFaces[face] = true;
-					foundMore = true;
-				}
-			}
-
-			if (!foundMore)
-			{
-				return;
-			}
-		}
-	}
-
-	private void markConnectedCoolArtifactFaces(Model model, boolean[] changedFaces)
-	{
-		int[] faceIndices1 = model.getFaceIndices1();
-		int[] faceIndices2 = model.getFaceIndices2();
-		int[] faceIndices3 = model.getFaceIndices3();
-		if (faceIndices1 == null || faceIndices2 == null || faceIndices3 == null)
-		{
-			return;
-		}
-
-		int faceCount = Math.min(model.getFaceCount(), changedFaces.length);
-		faceCount = Math.min(faceCount, Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
-		for (int pass = 0; pass < 2; pass++)
-		{
-			Set<Long> changedEdges = changedFaceEdges(faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
-			if (changedEdges.isEmpty())
-			{
-				return;
-			}
-
-			boolean foundMore = false;
-			for (int face = 0; face < faceCount; face++)
-			{
-				if (changedFaces[face] || !isCoolArtifactFace(model, face))
-				{
-					continue;
-				}
-
-				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face]))
+				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face])
+					|| hasChangedGeometryEdge(changedGeometryEdges, verticesX, verticesY, verticesZ, verticesCount,
+						faceIndices1[face], faceIndices2[face], faceIndices3[face]))
 				{
 					changedFaces[face] = true;
 					foundMore = true;
@@ -578,64 +538,12 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 
 	private void markMutedInteriorFaces(Model model, boolean[] changedFaces)
 	{
-		markRadialFaces(model, changedFaces, 0.52f, 1.0f, 1.0f, false, this::isMutedInteriorFace);
-		markConnectedMutedInteriorFaces(model, changedFaces);
-	}
-
-	/**
-	 * The radial cutoff above catches most of the inner ring, but a real mesh isn't a perfect
-	 * circle -- one section can dip slightly outside that radius (this is the gap on one side of
-	 * the ring). Rather than widening the radius (which also starts grabbing the surrounding rock
-	 * geometry, since it's part of the same model), this expands outward from whatever's already
-	 * been recolored by following actual face adjacency (shared edges), using a looser color
-	 * match. Because it can only spread through faces physically touching an already-recolored
-	 * face, it can't leap across to disconnected rock faces the way a wider radius or a globally
-	 * loosened color check would.
-	 */
-	private void markConnectedMutedInteriorFaces(Model model, boolean[] changedFaces)
-	{
-		int[] faceIndices1 = model.getFaceIndices1();
-		int[] faceIndices2 = model.getFaceIndices2();
-		int[] faceIndices3 = model.getFaceIndices3();
-		if (faceIndices1 == null || faceIndices2 == null || faceIndices3 == null)
-		{
-			return;
-		}
-
-		int faceCount = Math.min(model.getFaceCount(), changedFaces.length);
-		faceCount = Math.min(faceCount, Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
-		for (int pass = 0; pass < 3; pass++)
-		{
-			Set<Long> changedEdges = changedFaceEdges(faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
-			if (changedEdges.isEmpty())
-			{
-				return;
-			}
-
-			boolean foundMore = false;
-			for (int face = 0; face < faceCount; face++)
-			{
-				if (changedFaces[face] || !isSoftMutedInteriorFace(model, face))
-				{
-					continue;
-				}
-
-				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face]))
-				{
-					changedFaces[face] = true;
-					foundMore = true;
-				}
-			}
-
-			if (!foundMore)
-			{
-				return;
-			}
-		}
+		markRadialFaces(model, changedFaces, 0.52f, 1.0f, 1.0f, this::isMutedInteriorFace);
+		markConnectedFaces(model, changedFaces, 3, this::isSoftMutedInteriorFace);
 	}
 
 	private void markRadialFaces(Model model, boolean[] changedFaces, float centerRadiusScale,
-		float maxVertexRadiusScale, float maxRadialSpanScale, boolean requireChangedEdge, FaceMatcher faceMatcher)
+		float maxVertexRadiusScale, float maxRadialSpanScale, FaceMatcher faceMatcher)
 	{
 		int[] faceIndices1 = model.getFaceIndices1();
 		int[] faceIndices2 = model.getFaceIndices2();
@@ -680,19 +588,12 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		float maxVertexRadiusSquared = maxVertexRadius * maxVertexRadius;
 		float maxRadialSpan = maxRadius * maxRadialSpanScale;
 		int faceCount = Math.min(model.getFaceCount(), changedFaces.length);
-		faceCount = Math.min(faceCount, Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
-		Set<Long> changedEdges = requireChangedEdge
-			? changedFaceEdges(faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount)
-			: Collections.emptySet();
+		faceCount = Math.min(faceCount,
+			Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
 		for (int face = 0; face < faceCount; face++)
 		{
 			if (changedFaces[face] || !faceMatcher.matches(model, face)
 				|| !hasValidVertices(faceIndices1[face], faceIndices2[face], faceIndices3[face], verticesCount))
-			{
-				continue;
-			}
-			if (requireChangedEdge && !hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face],
-				faceIndices3[face]))
 			{
 				continue;
 			}
@@ -778,6 +679,67 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		return changedEdges.contains(edgeKey(vertex1, vertex2))
 			|| changedEdges.contains(edgeKey(vertex2, vertex3))
 			|| changedEdges.contains(edgeKey(vertex3, vertex1));
+	}
+
+	private int geometryVertexCount(Model model, float[] verticesX, float[] verticesY, float[] verticesZ)
+	{
+		if (verticesX == null || verticesY == null || verticesZ == null)
+		{
+			return 0;
+		}
+
+		return Math.min(model.getVerticesCount(), Math.min(verticesX.length, Math.min(verticesY.length, verticesZ.length)));
+	}
+
+	private Set<String> changedGeometryEdges(float[] verticesX, float[] verticesY, float[] verticesZ, int verticesCount,
+		int[] faceIndices1, int[] faceIndices2, int[] faceIndices3, boolean[] changedFaces, int faceCount)
+	{
+		if (verticesCount == 0)
+		{
+			return Collections.emptySet();
+		}
+
+		Set<String> edges = new HashSet<>();
+		for (int face = 0; face < faceCount; face++)
+		{
+			if (!changedFaces[face] || !hasValidVertices(faceIndices1[face], faceIndices2[face], faceIndices3[face],
+				verticesCount))
+			{
+				continue;
+			}
+
+			edges.add(geometryEdgeKey(verticesX, verticesY, verticesZ, faceIndices1[face], faceIndices2[face]));
+			edges.add(geometryEdgeKey(verticesX, verticesY, verticesZ, faceIndices2[face], faceIndices3[face]));
+			edges.add(geometryEdgeKey(verticesX, verticesY, verticesZ, faceIndices3[face], faceIndices1[face]));
+		}
+		return edges;
+	}
+
+	private boolean hasChangedGeometryEdge(Set<String> changedEdges, float[] verticesX, float[] verticesY,
+		float[] verticesZ, int verticesCount, int vertex1, int vertex2, int vertex3)
+	{
+		if (changedEdges.isEmpty() || !hasValidVertices(vertex1, vertex2, vertex3, verticesCount))
+		{
+			return false;
+		}
+
+		return changedEdges.contains(geometryEdgeKey(verticesX, verticesY, verticesZ, vertex1, vertex2))
+			|| changedEdges.contains(geometryEdgeKey(verticesX, verticesY, verticesZ, vertex2, vertex3))
+			|| changedEdges.contains(geometryEdgeKey(verticesX, verticesY, verticesZ, vertex3, vertex1));
+	}
+
+	private String geometryEdgeKey(float[] verticesX, float[] verticesY, float[] verticesZ, int vertex1, int vertex2)
+	{
+		String first = geometryVertexKey(verticesX, verticesY, verticesZ, vertex1);
+		String second = geometryVertexKey(verticesX, verticesY, verticesZ, vertex2);
+		return first.compareTo(second) <= 0 ? first + "|" + second : second + "|" + first;
+	}
+
+	private String geometryVertexKey(float[] verticesX, float[] verticesY, float[] verticesZ, int vertex)
+	{
+		return Float.floatToIntBits(verticesX[vertex]) + ":"
+			+ Float.floatToIntBits(verticesY[vertex]) + ":"
+			+ Float.floatToIntBits(verticesZ[vertex]);
 	}
 
 	private long edgeKey(int vertex1, int vertex2)
@@ -939,9 +901,7 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		int saturation = (rs2hsb >> 7) & 0x7;
 		int brightness = rs2hsb & 0x7F;
 
-		// Deliberately looser than isMutedInteriorColor -- safe here only because this is gated by
-		// edge-adjacency to an already-recolored face in markConnectedMutedInteriorFaces, so it
-		// can't match an isolated rock face sitting outside the ring.
+		// Safe here because this only runs through edge-adjacency to an already-recolored face.
 		boolean mutedBlueGreen = hue >= 12 && hue <= 50 && brightness >= 10 && brightness <= 92;
 		boolean neutralFloor = saturation <= 3 && brightness >= 12 && brightness <= 92;
 		boolean darkShadow = brightness >= 6 && brightness <= 30;
@@ -993,7 +953,7 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		{
 			if (!isModelStillTracked(model))
 			{
-				resetModel(model);
+				resetModelSafely(model);
 			}
 		}
 	}
@@ -1033,6 +993,18 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		if (colors != null)
 		{
 			colors.restore(model);
+		}
+	}
+
+	private void resetModelSafely(Model model)
+	{
+		try
+		{
+			resetModel(model);
+		}
+		catch (RuntimeException | AssertionError ex)
+		{
+			log.debug("Unable to restore Doom Unique model colors", ex);
 		}
 	}
 
@@ -1096,9 +1068,16 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 
 		String formatted = "Doom Unique: " + message;
 		log.info(formatted);
-		if (client.getGameState() == GameState.LOGGED_IN)
+		try
 		{
-			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", formatted, null);
+			if (client.getGameState() == GameState.LOGGED_IN)
+			{
+				client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", formatted, null);
+			}
+		}
+		catch (RuntimeException | AssertionError ex)
+		{
+			log.debug("Unable to send Doom Unique status message", ex);
 		}
 	}
 
