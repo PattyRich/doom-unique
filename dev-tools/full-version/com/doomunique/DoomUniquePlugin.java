@@ -2,27 +2,36 @@ package com.doomunique;
 
 import com.google.inject.Provides;
 import java.awt.Color;
+import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Animation;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.DecorativeObject;
+import net.runelite.api.DynamicObject;
 import net.runelite.api.GameObject;
 import net.runelite.api.GameState;
 import net.runelite.api.GroundObject;
 import net.runelite.api.Model;
+import net.runelite.api.ModelData;
+import net.runelite.api.ObjectComposition;
+import net.runelite.api.Player;
 import net.runelite.api.Renderable;
+import net.runelite.api.RuneLiteObject;
 import net.runelite.api.Scene;
 import net.runelite.api.Tile;
 import net.runelite.api.TileObject;
 import net.runelite.api.WallObject;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.DecorativeObjectDespawned;
 import net.runelite.api.events.DecorativeObjectSpawned;
@@ -41,14 +50,8 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
 
-/**
- * Shipped, player-facing version of the plugin. The local-testing tooling that used to live
- * here (discovery mode, temporary test-object recolor, swap-to-unique-hole, and the raw object
- * definition cache parser) has been moved to dev-tools/full-version at the repo root. That code
- * never ran for a normal player (it's all opt-in/off by default) but it added real maintenance
- * and review surface for zero player benefit, so it doesn't ship.
- */
 @PluginDescriptor(
 	name = "Doom Unique Colors",
 	description = "Customize the special-loot hole color at Doom of Mokhaiotl",
@@ -68,24 +71,19 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 	@Inject
 	private RenderCallbackManager renderCallbackManager;
 
+
 	@Inject
 	private DoomUniqueConfig config;
 
 	private final Map<TileObject, Set<Model>> objectModels = new IdentityHashMap<>();
+	private final Map<TileObject, RuneLiteObject> testSwapObjects = new IdentityHashMap<>();
 	private final Map<Model, ModelColors> originalColors = new IdentityHashMap<>();
-
-	/**
-	 * Whether a model's faces look "gold" is a property of the object's model topology
-	 * (i.e. of its object ID), not of any one rendered Model instance. Animated objects can
-	 * hand back a freshly built Model on many frames, and drawObject() is called on basically
-	 * every render frame for every visible object, so caching the expensive multi-pass face
-	 * analysis by Model identity (the old approach) meant it could re-run at full framerate for
-	 * as long as the hole was on screen. Caching it by object ID instead means the analysis
-	 * runs once and every subsequent frame just reapplies the cached face mask.
-	 */
-	private final Map<Integer, boolean[]> goldFaceMaskCache = new HashMap<>();
 	private final Set<String> statusMessages = new HashSet<>();
 
+	private Set<Integer> uniqueHoleIds = Collections.emptySet();
+	private Set<Integer> testObjectIds = Collections.emptySet();
+	private Model uniqueHoleSwapModel;
+	private ObjectModelDefinition uniqueHoleSwapDefinition;
 	private int ticks;
 
 	@Provides
@@ -97,8 +95,13 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 	@Override
 	protected void startUp()
 	{
+		refreshObjectIds();
 		renderCallbackManager.register(this);
-		clientThread.invokeLater(this::scanSceneForHoles);
+		clientThread.invokeLater(() ->
+		{
+			scanSceneForHoles();
+			scanSceneForTestSwaps();
+		});
 	}
 
 	@Override
@@ -107,8 +110,10 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		clientThread.invokeLater(() ->
 		{
 			resetAllModels();
+			clearTestSwaps();
 			statusMessages.clear();
-			goldFaceMaskCache.clear();
+			uniqueHoleIds = Collections.emptySet();
+			testObjectIds = Collections.emptySet();
 			ticks = 0;
 			renderCallbackManager.unregister(this);
 		});
@@ -118,7 +123,7 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 	public boolean drawObject(Scene scene, TileObject object)
 	{
 		handleSceneObjectSafely(object);
-		return true;
+		return !shouldHideForTestSwap(object);
 	}
 
 	@Subscribe
@@ -127,11 +132,13 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		if (event.getGameState() == GameState.LOADING)
 		{
 			resetAllModels();
+			clearTestSwaps();
 			statusMessages.clear();
 		}
 		else if (event.getGameState() == GameState.LOGGED_IN)
 		{
 			scanSceneForHoles();
+			scanSceneForTestSwaps();
 		}
 	}
 
@@ -150,6 +157,7 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		}
 
 		scanSceneForHoles();
+		scanSceneForTestSwaps();
 	}
 
 	@Subscribe
@@ -162,9 +170,12 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 
 		clientThread.invokeLater(() ->
 		{
+			refreshObjectIds();
 			resetAllModels();
+			clearTestSwaps();
 			statusMessages.clear();
 			scanSceneForHoles();
+			scanSceneForTestSwaps();
 		});
 	}
 
@@ -216,6 +227,12 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		resetIfTracked(event.getWallObject());
 	}
 
+	private void refreshObjectIds()
+	{
+		uniqueHoleIds = ObjectIdParser.parse(config.uniqueHoleObjectIds());
+		testObjectIds = ObjectIdParser.parse(config.testObjectIds());
+	}
+
 	private void scanSceneForHoles()
 	{
 		if (!isSceneReady() || !hasConfiguredSceneTargets())
@@ -234,9 +251,56 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		}
 	}
 
+	private void scanSceneForTestSwaps()
+	{
+		if (!isSceneReady() || !config.swapTestObjects() || testObjectIds.isEmpty())
+		{
+			clearTestSwaps();
+			return;
+		}
+
+		try
+		{
+			Set<TileObject> activeTargets = Collections.newSetFromMap(new IdentityHashMap<>());
+			int[] matchedTestObjectIds = new int[1];
+			forEachSceneObject(object ->
+			{
+				if (isConfiguredTestObjectId(object))
+				{
+					matchedTestObjectIds[0]++;
+				}
+				if (shouldSwapTestObject(object))
+				{
+					activeTargets.add(object);
+					swapTestObjectIfMatched(object);
+				}
+			});
+
+			removeInactiveTestSwaps(activeTargets);
+			if (activeTargets.isEmpty())
+			{
+				if (matchedTestObjectIds[0] > 0)
+				{
+					messageOnce("swap-type-no-match:" + testObjectIds + ":" + config.testObjectType(),
+						"Swap IDs matched loaded objects, but none were " + config.testObjectType() + ".");
+				}
+				else
+				{
+					messageOnce("swap-no-match:" + testObjectIds,
+						"No loaded game objects matched swap test IDs " + testObjectIds + ".");
+				}
+			}
+		}
+		catch (RuntimeException | AssertionError ex)
+		{
+			log.warn("Unable to scan Doom Unique test swaps", ex);
+			messageOnce("swap-scan-error", "Swap scan failed once; skipping this scan. See client.log.");
+		}
+	}
+
 	private boolean hasConfiguredSceneTargets()
 	{
-		return config.recolorUniqueHole();
+		return config.recolorUniqueHole() && !uniqueHoleIds.isEmpty();
 	}
 
 	private boolean isSceneReady()
@@ -268,6 +332,263 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		}
 	}
 
+	private boolean isConfiguredTestObject(TileObject object)
+	{
+		return isConfiguredTestObjectId(object) && isConfiguredTestObjectType(object);
+	}
+
+	private boolean isConfiguredTestObjectId(TileObject object)
+	{
+		return object != null && testObjectIds.contains(object.getId());
+	}
+
+	private boolean isConfiguredTestObjectType(TileObject object)
+	{
+		switch (config.testObjectType())
+		{
+			case ANY:
+				return true;
+			case GAME:
+				return object instanceof GameObject;
+			case GROUND:
+				return object instanceof GroundObject;
+			case DECORATIVE:
+				return object instanceof DecorativeObject;
+			case WALL:
+				return object instanceof WallObject;
+			default:
+				return false;
+		}
+	}
+
+
+
+	private boolean swapTestObjectIfMatched(TileObject object)
+	{
+		if (!shouldSwapTestObject(object))
+		{
+			return false;
+		}
+
+		Model model = getUniqueHoleSwapModel();
+		if (model == null)
+		{
+			return false;
+		}
+
+		RuneLiteObject runeLiteObject = testSwapObjects.get(object);
+		if (runeLiteObject == null)
+		{
+			runeLiteObject = client.createRuneLiteObject();
+			runeLiteObject.setModel(model);
+			runeLiteObject.setShouldLoop(true);
+			Animation animation = getSwapAnimation();
+			if (animation != null)
+			{
+				runeLiteObject.setAnimation(animation);
+			}
+			client.registerRuneLiteObject(runeLiteObject);
+			testSwapObjects.put(object, runeLiteObject);
+			messageOnce("swap:" + object.getId() + ":" + objectType(object), "Swap active for "
+				+ objectType(object) + " object ID " + object.getId()
+				+ " -> " + config.swapTargetObjectId()
+				+ " using animation " + swapAnimationId() + ".");
+		}
+
+		runeLiteObject.setLocation(object.getLocalLocation(), object.getPlane());
+		runeLiteObject.setOrientation(modelOrientation(object));
+		runeLiteObject.setActive(true);
+		return true;
+	}
+
+	private boolean shouldSwapTestObject(TileObject object)
+	{
+		return config.swapTestObjects()
+			&& object instanceof GameObject
+			&& isConfiguredTestObject(object);
+	}
+
+	private boolean shouldHideForTestSwap(TileObject object)
+	{
+		return shouldSwapTestObject(object);
+	}
+
+	private int modelOrientation(TileObject object)
+	{
+		if (object instanceof GameObject)
+		{
+			return ((GameObject) object).getModelOrientation();
+		}
+		if (object instanceof WallObject)
+		{
+			return ((WallObject) object).getOrientationA();
+		}
+		return 0;
+	}
+
+	private Model getUniqueHoleSwapModel()
+	{
+		if (uniqueHoleSwapModel != null)
+		{
+			return uniqueHoleSwapModel;
+		}
+
+		try
+		{
+			uniqueHoleSwapDefinition = ObjectModelDefinition.load(client.getIndexConfig(), config.swapTargetObjectId());
+			if (uniqueHoleSwapDefinition == null)
+			{
+				log.warn("Unable to load object definition {} for Doom Unique test swap", config.swapTargetObjectId());
+				messageOnce("swap-definition-missing:" + config.swapTargetObjectId(),
+					"Could not load object definition " + config.swapTargetObjectId() + ".");
+				return null;
+			}
+
+			uniqueHoleSwapModel = buildObjectModel(config.swapTargetObjectId(), uniqueHoleSwapDefinition);
+			if (uniqueHoleSwapModel != null && config.recolorSwapTestObjects())
+			{
+				int recoloredFaces = recolorModel(uniqueHoleSwapModel, config.uniqueHoleColor());
+				if (recoloredFaces == 0)
+				{
+					messageOnce("swap-no-gold-faces:" + config.swapTargetObjectId(),
+						"Swap target " + config.swapTargetObjectId()
+							+ " had no gold/yellow faces to recolor.");
+				}
+				else
+				{
+					messageOnce("swap-recolored:" + config.swapTargetObjectId(),
+						"Recolored " + recoloredFaces + " faces on swap target "
+							+ config.swapTargetObjectId() + ".");
+				}
+			}
+		}
+		catch (IllegalArgumentException ex)
+		{
+			log.warn("Unable to build object model {} for Doom Unique test swap", config.swapTargetObjectId(), ex);
+			messageOnce("swap-build-failed:" + config.swapTargetObjectId(),
+				"Could not build swap target " + config.swapTargetObjectId() + ". See client.log.");
+		}
+		catch (RuntimeException ex)
+		{
+			log.warn("Unable to build object model {} for Doom Unique test swap", config.swapTargetObjectId(), ex);
+			messageOnce("swap-build-failed:" + config.swapTargetObjectId(),
+				"Could not build swap target " + config.swapTargetObjectId() + ". See client.log.");
+		}
+
+		return uniqueHoleSwapModel;
+	}
+
+	private Animation getSwapAnimation()
+	{
+		int animationId = swapAnimationId();
+		if (animationId < 0)
+		{
+			return null;
+		}
+
+		Animation animation = client.loadAnimation(animationId);
+		if (animation == null)
+		{
+			messageOnce("swap-animation-missing:" + animationId,
+				"Could not load animation " + animationId
+					+ " for swap target " + config.swapTargetObjectId() + ".");
+		}
+		return animation;
+	}
+
+	private int swapAnimationId()
+	{
+		if (uniqueHoleSwapDefinition != null && uniqueHoleSwapDefinition.hasAnimation())
+		{
+			return uniqueHoleSwapDefinition.getAnimationId();
+		}
+
+		return -1;
+	}
+
+	private Model buildObjectModel(int objectId, ObjectModelDefinition definition)
+	{
+		int[] modelIds = definition.getModelIds();
+		if (modelIds.length == 0)
+		{
+			log.warn("Object definition {} has no model IDs for Doom Unique test swap", objectId);
+			messageOnce("swap-model-ids-missing:" + objectId, "Object definition " + objectId + " has no model IDs.");
+			return null;
+		}
+
+		List<ModelData> modelData = new ArrayList<>();
+		for (int modelId : modelIds)
+		{
+			ModelData data = client.loadModelData(modelId);
+			if (data == null)
+			{
+				log.warn("Unable to load model {} for object {} test swap", modelId, objectId);
+				messageOnce("swap-model-missing:" + objectId + ":" + modelId,
+					"Could not load model " + modelId + " for object " + objectId + ".");
+				continue;
+			}
+
+			data = data.cloneVertices().cloneColors();
+			if (data.getFaceTextures() != null)
+			{
+				data = data.cloneTextures();
+			}
+			if (data.getFaceTransparencies() != null)
+			{
+				data = data.cloneTransparencies();
+			}
+			if (definition.isRotated())
+			{
+				data.rotateY90Ccw();
+			}
+			applyDefinitionRecolors(data, definition);
+			modelData.add(data);
+		}
+
+		if (modelData.isEmpty())
+		{
+			messageOnce("swap-no-models-loaded:" + objectId, "No models loaded for swap target " + objectId + ".");
+			return null;
+		}
+
+		ModelData merged = modelData.size() == 1
+			? modelData.get(0)
+			: client.mergeModels(modelData.toArray(new ModelData[0]), modelData.size());
+		if (definition.isScaled())
+		{
+			merged.scale(definition.getModelSizeX(), definition.getModelHeight(), definition.getModelSizeY());
+		}
+		if (definition.isTranslated())
+		{
+			merged.translate(definition.getOffsetX(), definition.getOffsetHeight(), definition.getOffsetY());
+		}
+
+		return merged.light();
+	}
+
+	private void applyDefinitionRecolors(ModelData modelData, ObjectModelDefinition definition)
+	{
+		short[] recolorFrom = definition.getRecolorFrom();
+		short[] recolorTo = definition.getRecolorTo();
+		if (recolorFrom != null && recolorTo != null)
+		{
+			for (int i = 0; i < recolorFrom.length; i++)
+			{
+				modelData.recolor(recolorFrom[i], recolorTo[i]);
+			}
+		}
+
+		short[] retextureFrom = definition.getRetextureFrom();
+		short[] retextureTo = definition.getRetextureTo();
+		if (retextureFrom != null && retextureTo != null && modelData.getFaceTextures() != null)
+		{
+			for (int i = 0; i < retextureFrom.length; i++)
+			{
+				modelData.retexture(retextureFrom[i], retextureTo[i]);
+			}
+		}
+	}
+
 	private void recolorIfMatched(TileObject object)
 	{
 		Color color = colorFor(object);
@@ -286,12 +607,13 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		int recoloredFaces = 0;
 		for (Model model : models)
 		{
-			recoloredFaces += recolorModel(object.getId(), model, color);
+			recoloredFaces += recolorModel(model, color);
 		}
 		if (recoloredFaces == 0)
 		{
-			messageOnce("no-gold-faces:" + object.getId(),
-				"Matched object ID " + object.getId() + ", but found no gold/yellow model faces to recolor.");
+			messageOnce("no-gold-faces:" + object.getId() + ":" + objectType(object),
+				"Matched " + objectType(object) + " object ID " + object.getId()
+					+ ", but found no gold/yellow model faces to recolor.");
 		}
 	}
 
@@ -324,15 +646,18 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 			return null;
 		}
 
-		if (config.recolorUniqueHole() && object.getId() == DoomUniqueConfig.DOM_DESCEND_HOLE_UNIQUE)
+		int objectId = object.getId();
+		if (config.recolorUniqueHole() && uniqueHoleIds.contains(objectId))
 		{
 			return config.uniqueHoleColor();
 		}
 
+
+
 		return null;
 	}
 
-	private int recolorModel(int objectId, Model model, Color color)
+	private int recolorModel(Model model, Color color)
 	{
 		if (model == null || color == null)
 		{
@@ -342,28 +667,14 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		originalColors.computeIfAbsent(model, ModelColors::copy);
 		int rs2hsb = colorToRs2hsb(color);
 
-		boolean[] changedFaces = goldFaceMask(objectId, model);
+		boolean[] changedFaces = findGoldFaces(model);
 		int recoloredFaces = countChangedFaces(changedFaces);
 		recolorFaces(model.getFaceColors1(), rs2hsb, changedFaces);
 		recolorFaces(model.getFaceColors2(), rs2hsb, changedFaces);
 		recolorFaces(model.getFaceColors3(), rs2hsb, changedFaces);
 		recolorFaces(model.getUnlitFaceColors(), (short) rs2hsb, changedFaces);
 		clearRecoloredFaceTextures(model.getFaceTextures(), changedFaces);
-
 		return recoloredFaces;
-	}
-
-	private boolean[] goldFaceMask(int objectId, Model model)
-	{
-		boolean[] cached = goldFaceMaskCache.get(objectId);
-		if (cached != null && cached.length == maxFaceCount(model))
-		{
-			return cached;
-		}
-
-		boolean[] mask = findGoldFaces(model);
-		goldFaceMaskCache.put(objectId, mask);
-		return mask;
 	}
 
 	private boolean[] findGoldFaces(Model model)
@@ -497,6 +808,9 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		int[] faceIndices1 = model.getFaceIndices1();
 		int[] faceIndices2 = model.getFaceIndices2();
 		int[] faceIndices3 = model.getFaceIndices3();
+		float[] verticesX = model.getVerticesX();
+		float[] verticesY = model.getVerticesY();
+		float[] verticesZ = model.getVerticesZ();
 		if (faceIndices1 == null || faceIndices2 == null || faceIndices3 == null)
 		{
 			return;
@@ -504,10 +818,13 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 
 		int faceCount = Math.min(model.getFaceCount(), changedFaces.length);
 		faceCount = Math.min(faceCount, Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
+		int verticesCount = geometryVertexCount(model, verticesX, verticesY, verticesZ);
 		for (int pass = 0; pass < 3; pass++)
 		{
 			Set<Long> changedEdges = changedFaceEdges(faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
-			if (changedEdges.isEmpty())
+			Set<String> changedGeometryEdges = changedGeometryEdges(verticesX, verticesY, verticesZ, verticesCount,
+				faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
+			if (changedEdges.isEmpty() && changedGeometryEdges.isEmpty())
 			{
 				return;
 			}
@@ -520,7 +837,9 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 					continue;
 				}
 
-				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face]))
+				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face])
+					|| hasChangedGeometryEdge(changedGeometryEdges, verticesX, verticesY, verticesZ, verticesCount,
+						faceIndices1[face], faceIndices2[face], faceIndices3[face]))
 				{
 					changedFaces[face] = true;
 					foundMore = true;
@@ -539,6 +858,9 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		int[] faceIndices1 = model.getFaceIndices1();
 		int[] faceIndices2 = model.getFaceIndices2();
 		int[] faceIndices3 = model.getFaceIndices3();
+		float[] verticesX = model.getVerticesX();
+		float[] verticesY = model.getVerticesY();
+		float[] verticesZ = model.getVerticesZ();
 		if (faceIndices1 == null || faceIndices2 == null || faceIndices3 == null)
 		{
 			return;
@@ -546,10 +868,13 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 
 		int faceCount = Math.min(model.getFaceCount(), changedFaces.length);
 		faceCount = Math.min(faceCount, Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
+		int verticesCount = geometryVertexCount(model, verticesX, verticesY, verticesZ);
 		for (int pass = 0; pass < 2; pass++)
 		{
 			Set<Long> changedEdges = changedFaceEdges(faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
-			if (changedEdges.isEmpty())
+			Set<String> changedGeometryEdges = changedGeometryEdges(verticesX, verticesY, verticesZ, verticesCount,
+				faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
+			if (changedEdges.isEmpty() && changedGeometryEdges.isEmpty())
 			{
 				return;
 			}
@@ -562,7 +887,9 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 					continue;
 				}
 
-				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face]))
+				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face])
+					|| hasChangedGeometryEdge(changedGeometryEdges, verticesX, verticesY, verticesZ, verticesCount,
+						faceIndices1[face], faceIndices2[face], faceIndices3[face]))
 				{
 					changedFaces[face] = true;
 					foundMore = true;
@@ -582,21 +909,14 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		markConnectedMutedInteriorFaces(model, changedFaces);
 	}
 
-	/**
-	 * The radial cutoff above catches most of the inner ring, but a real mesh isn't a perfect
-	 * circle -- one section can dip slightly outside that radius (this is the gap on one side of
-	 * the ring). Rather than widening the radius (which also starts grabbing the surrounding rock
-	 * geometry, since it's part of the same model), this expands outward from whatever's already
-	 * been recolored by following actual face adjacency (shared edges), using a looser color
-	 * match. Because it can only spread through faces physically touching an already-recolored
-	 * face, it can't leap across to disconnected rock faces the way a wider radius or a globally
-	 * loosened color check would.
-	 */
 	private void markConnectedMutedInteriorFaces(Model model, boolean[] changedFaces)
 	{
 		int[] faceIndices1 = model.getFaceIndices1();
 		int[] faceIndices2 = model.getFaceIndices2();
 		int[] faceIndices3 = model.getFaceIndices3();
+		float[] verticesX = model.getVerticesX();
+		float[] verticesY = model.getVerticesY();
+		float[] verticesZ = model.getVerticesZ();
 		if (faceIndices1 == null || faceIndices2 == null || faceIndices3 == null)
 		{
 			return;
@@ -604,10 +924,13 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 
 		int faceCount = Math.min(model.getFaceCount(), changedFaces.length);
 		faceCount = Math.min(faceCount, Math.min(faceIndices1.length, Math.min(faceIndices2.length, faceIndices3.length)));
+		int verticesCount = geometryVertexCount(model, verticesX, verticesY, verticesZ);
 		for (int pass = 0; pass < 3; pass++)
 		{
 			Set<Long> changedEdges = changedFaceEdges(faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
-			if (changedEdges.isEmpty())
+			Set<String> changedGeometryEdges = changedGeometryEdges(verticesX, verticesY, verticesZ, verticesCount,
+				faceIndices1, faceIndices2, faceIndices3, changedFaces, faceCount);
+			if (changedEdges.isEmpty() && changedGeometryEdges.isEmpty())
 			{
 				return;
 			}
@@ -620,7 +943,9 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 					continue;
 				}
 
-				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face]))
+				if (hasChangedEdge(changedEdges, faceIndices1[face], faceIndices2[face], faceIndices3[face])
+					|| hasChangedGeometryEdge(changedGeometryEdges, verticesX, verticesY, verticesZ, verticesCount,
+						faceIndices1[face], faceIndices2[face], faceIndices3[face]))
 				{
 					changedFaces[face] = true;
 					foundMore = true;
@@ -778,6 +1103,67 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		return changedEdges.contains(edgeKey(vertex1, vertex2))
 			|| changedEdges.contains(edgeKey(vertex2, vertex3))
 			|| changedEdges.contains(edgeKey(vertex3, vertex1));
+	}
+
+	private int geometryVertexCount(Model model, float[] verticesX, float[] verticesY, float[] verticesZ)
+	{
+		if (verticesX == null || verticesY == null || verticesZ == null)
+		{
+			return 0;
+		}
+
+		return Math.min(model.getVerticesCount(), Math.min(verticesX.length, Math.min(verticesY.length, verticesZ.length)));
+	}
+
+	private Set<String> changedGeometryEdges(float[] verticesX, float[] verticesY, float[] verticesZ, int verticesCount,
+		int[] faceIndices1, int[] faceIndices2, int[] faceIndices3, boolean[] changedFaces, int faceCount)
+	{
+		if (verticesCount == 0)
+		{
+			return Collections.emptySet();
+		}
+
+		Set<String> edges = new HashSet<>();
+		for (int face = 0; face < faceCount; face++)
+		{
+			if (!changedFaces[face] || !hasValidVertices(faceIndices1[face], faceIndices2[face], faceIndices3[face],
+				verticesCount))
+			{
+				continue;
+			}
+
+			edges.add(geometryEdgeKey(verticesX, verticesY, verticesZ, faceIndices1[face], faceIndices2[face]));
+			edges.add(geometryEdgeKey(verticesX, verticesY, verticesZ, faceIndices2[face], faceIndices3[face]));
+			edges.add(geometryEdgeKey(verticesX, verticesY, verticesZ, faceIndices3[face], faceIndices1[face]));
+		}
+		return edges;
+	}
+
+	private boolean hasChangedGeometryEdge(Set<String> changedEdges, float[] verticesX, float[] verticesY,
+		float[] verticesZ, int verticesCount, int vertex1, int vertex2, int vertex3)
+	{
+		if (changedEdges.isEmpty() || !hasValidVertices(vertex1, vertex2, vertex3, verticesCount))
+		{
+			return false;
+		}
+
+		return changedEdges.contains(geometryEdgeKey(verticesX, verticesY, verticesZ, vertex1, vertex2))
+			|| changedEdges.contains(geometryEdgeKey(verticesX, verticesY, verticesZ, vertex2, vertex3))
+			|| changedEdges.contains(geometryEdgeKey(verticesX, verticesY, verticesZ, vertex3, vertex1));
+	}
+
+	private String geometryEdgeKey(float[] verticesX, float[] verticesY, float[] verticesZ, int vertex1, int vertex2)
+	{
+		String first = geometryVertexKey(verticesX, verticesY, verticesZ, vertex1);
+		String second = geometryVertexKey(verticesX, verticesY, verticesZ, vertex2);
+		return first.compareTo(second) <= 0 ? first + "|" + second : second + "|" + first;
+	}
+
+	private String geometryVertexKey(float[] verticesX, float[] verticesY, float[] verticesZ, int vertex)
+	{
+		return Float.floatToIntBits(verticesX[vertex]) + ":"
+			+ Float.floatToIntBits(verticesY[vertex]) + ":"
+			+ Float.floatToIntBits(verticesZ[vertex]);
 	}
 
 	private long edgeKey(int vertex1, int vertex2)
@@ -939,9 +1325,6 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		int saturation = (rs2hsb >> 7) & 0x7;
 		int brightness = rs2hsb & 0x7F;
 
-		// Deliberately looser than isMutedInteriorColor -- safe here only because this is gated by
-		// edge-adjacency to an already-recolored face in markConnectedMutedInteriorFaces, so it
-		// can't match an isolated rock face sitting outside the ring.
 		boolean mutedBlueGreen = hue >= 12 && hue <= 50 && brightness >= 10 && brightness <= 92;
 		boolean neutralFloor = saturation <= 3 && brightness >= 12 && brightness <= 92;
 		boolean darkShadow = brightness >= 6 && brightness <= 30;
@@ -983,6 +1366,9 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 
 	private void resetIfTracked(TileObject object)
 	{
+
+		removeTestSwap(object);
+
 		Set<Model> models = objectModels.remove(object);
 		if (models == null)
 		{
@@ -1025,6 +1411,63 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		}
 		originalColors.clear();
 		objectModels.clear();
+		uniqueHoleSwapModel = null;
+		uniqueHoleSwapDefinition = null;
+	}
+
+	private void clearTestSwaps()
+	{
+		for (RuneLiteObject runeLiteObject : testSwapObjects.values())
+		{
+			removeRuneLiteObjectSafely(runeLiteObject);
+		}
+		testSwapObjects.clear();
+	}
+
+	private void removeInactiveTestSwaps(Set<TileObject> activeTargets)
+	{
+		Iterator<Map.Entry<TileObject, RuneLiteObject>> iterator = testSwapObjects.entrySet().iterator();
+		while (iterator.hasNext())
+		{
+			Map.Entry<TileObject, RuneLiteObject> entry = iterator.next();
+			if (!activeTargets.contains(entry.getKey()))
+			{
+				removeRuneLiteObjectSafely(entry.getValue());
+				iterator.remove();
+			}
+		}
+	}
+
+	private void removeTestSwap(TileObject object)
+	{
+		RuneLiteObject runeLiteObject = testSwapObjects.remove(object);
+		if (runeLiteObject == null)
+		{
+			return;
+		}
+
+		removeRuneLiteObjectSafely(runeLiteObject);
+	}
+
+	private void removeRuneLiteObjectSafely(RuneLiteObject runeLiteObject)
+	{
+		if (runeLiteObject == null)
+		{
+			return;
+		}
+
+		try
+		{
+			runeLiteObject.setActive(false);
+			if (client.isRuneLiteObjectRegistered(runeLiteObject))
+			{
+				client.removeRuneLiteObject(runeLiteObject);
+			}
+		}
+		catch (RuntimeException | AssertionError ex)
+		{
+			log.debug("Unable to remove Doom Unique RuneLiteObject", ex);
+		}
 	}
 
 	private void resetModel(Model model)
@@ -1087,6 +1530,33 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		}
 	}
 
+
+
+	private String objectAnimationInfo(TileObject object)
+	{
+		if (!(object instanceof GameObject))
+		{
+			return "";
+		}
+
+		Renderable renderable = ((GameObject) object).getRenderable();
+		if (!(renderable instanceof DynamicObject))
+		{
+			return "";
+		}
+
+		DynamicObject dynamicObject = (DynamicObject) renderable;
+		Animation animation = dynamicObject.getAnimation();
+		if (animation == null)
+		{
+			return "";
+		}
+
+		return " animation=" + animation.getId()
+			+ " frame=" + dynamicObject.getAnimFrame()
+			+ " cycle=" + dynamicObject.getAnimCycle();
+	}
+
 	private void messageOnce(String key, String message)
 	{
 		if (!statusMessages.add(key))
@@ -1100,6 +1570,44 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		{
 			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", formatted, null);
 		}
+	}
+
+	private boolean isWithinRadius(WorldPoint center, WorldPoint point, int radius)
+	{
+		return center.getPlane() == point.getPlane()
+			&& Math.abs(center.getX() - point.getX()) <= radius
+			&& Math.abs(center.getY() - point.getY()) <= radius;
+	}
+
+	private String getObjectName(int objectId)
+	{
+		ObjectComposition definition = client.getObjectDefinition(objectId);
+		if (definition == null || definition.getName() == null || "null".equals(definition.getName()))
+		{
+			return "unknown";
+		}
+		return definition.getName();
+	}
+
+	private String objectType(TileObject object)
+	{
+		if (object instanceof GameObject)
+		{
+			return "game";
+		}
+		if (object instanceof GroundObject)
+		{
+			return "ground";
+		}
+		if (object instanceof DecorativeObject)
+		{
+			return "decorative";
+		}
+		if (object instanceof WallObject)
+		{
+			return "wall";
+		}
+		return "tile";
 	}
 
 	private void forEachSceneObject(SceneObjectConsumer consumer)

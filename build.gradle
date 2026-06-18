@@ -15,6 +15,20 @@ repositories {
 
 def runeLiteVersion = 'latest.release'
 def pluginMainClass = 'com.doomunique.DoomUniquePluginTest'
+def devToolsMainClass = 'com.doomunique.DoomUniqueDevRunner'
+
+// Separate, self-contained source set for the local dev build (configurable IDs,
+// debug recolor controls, swap-to-unique-hole). It does not extend or share classes with
+// `main`, so the two plugin classes (both named com.doomunique.DoomUniquePlugin, one slim, one
+// full) never end up on the same classpath at once. Nothing here is pulled into the `jar` or
+// `shadowJar` outputs, and the Plugin Hub only ever builds from `main`, so none of this ships.
+sourceSets {
+	devTools {
+		java {
+			srcDirs = ['dev-tools/full-version']
+		}
+	}
+}
 
 dependencies {
 	compileOnly group: 'net.runelite', name:'client', version: runeLiteVersion
@@ -25,6 +39,11 @@ dependencies {
 	testImplementation 'junit:junit:4.12'
 	testImplementation group: 'net.runelite', name:'client', version: runeLiteVersion
 	testImplementation group: 'net.runelite', name:'jshell', version: runeLiteVersion
+
+	devToolsImplementation group: 'net.runelite', name: 'client', version: runeLiteVersion
+	devToolsImplementation group: 'net.runelite', name: 'jshell', version: runeLiteVersion
+	devToolsCompileOnly 'org.projectlombok:lombok:1.18.30'
+	devToolsAnnotationProcessor 'org.projectlombok:lombok:1.18.30'
 }
 
 group = 'com.doomunique'
@@ -38,6 +57,14 @@ tasks.withType(JavaCompile).configureEach {
 tasks.register('run', JavaExec) {
 	classpath = sourceSets.test.runtimeClasspath
 	mainClass = pluginMainClass
+
+	jvmArgs "-ea"
+	args "--developer-mode", "--debug"
+}
+
+tasks.register('runDev', JavaExec) {
+	classpath = sourceSets.devTools.runtimeClasspath
+	mainClass = devToolsMainClass
 
 	jvmArgs "-ea"
 	args "--developer-mode", "--debug"
