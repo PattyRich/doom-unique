@@ -213,7 +213,7 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 	{
 		try
 		{
-			if (!isSceneReady() || !hasConfiguredSceneTargets())
+			if (!isSceneReady() || !config.recolorUniqueHole())
 			{
 				return;
 			}
@@ -227,11 +227,6 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		}
 	}
 
-	private boolean hasConfiguredSceneTargets()
-	{
-		return config.recolorUniqueHole();
-	}
-
 	private boolean isSceneReady()
 	{
 		if (client.getGameState() != GameState.LOGGED_IN)
@@ -243,16 +238,11 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		return worldView != null && worldView.getScene() != null && worldView.getScene().getTiles() != null;
 	}
 
-	private void handleSceneObject(TileObject object)
-	{
-		recolorIfMatched(object);
-	}
-
 	private void handleSceneObjectSafely(TileObject object)
 	{
 		try
 		{
-			handleSceneObject(object);
+			recolorIfMatched(object);
 		}
 		catch (RuntimeException | AssertionError ex)
 		{
@@ -987,20 +977,15 @@ public class DoomUniquePlugin extends Plugin implements RenderCallback
 		objectModels.clear();
 	}
 
-	private void resetModel(Model model)
-	{
-		ModelColors colors = originalColors.remove(model);
-		if (colors != null)
-		{
-			colors.restore(model);
-		}
-	}
-
 	private void resetModelSafely(Model model)
 	{
 		try
 		{
-			resetModel(model);
+			ModelColors colors = originalColors.remove(model);
+			if (colors != null)
+			{
+				colors.restore(model);
+			}
 		}
 		catch (RuntimeException | AssertionError ex)
 		{
